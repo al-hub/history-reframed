@@ -1,0 +1,192 @@
+name: Selective LIST achievement repair v5
+
+on:
+  push:
+    paths:
+      - .github/workflows/selective-achievement-fix-v5.yml
+
+permissions:
+  contents: write
+
+jobs:
+  repair:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Resolve names with combined spacing queries
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          from concurrent.futures import ThreadPoolExecutor, as_completed
+          from collections import Counter
+          import html,json,re,urllib.parse,urllib.request
+
+          path=Path('LIST.md'); lines=path.read_text(encoding='utf-8').splitlines()
+          headers={'User-Agent':'history-reframed-list-repair/5.0'}
+          markers=('중요한 영향을 끼침','큰 영향을 끼침','중요한 업적을 남김','중요한 기여를 함')
+          def parse(line):
+              if not line.startswith('- ') or ' — ' not in line:return None
+              left,ach=line[2:].split(' — ',1); left=left.strip(); ach=ach.strip()
+              name=left[1:left.index('](')] if left.startswith('[') and '](' in left else left
+              return left,name.strip(),ach
+          def norm(s):return re.sub(r'[^0-9A-Za-z가-힣]','',s).lower()
+          def ct(s):return norm(re.sub(r'\s*\([^)]*\)\s*$','',s))
+          targets=[]; sec=False; heading=''
+          for i,line in enumerate(lines):
+              if line.strip()=='## 2차 확장 후보':sec=True;continue
+              if sec and line.startswith('### '):heading=line[4:].strip();continue
+              p=parse(line) if sec else None
+              if p and any(m in p[2] for m in markers):targets.append((i,*p,heading))
+
+          def get(url,t=10):
+              try:
+                  req=urllib.request.Request(url,headers=headers)
+                  with urllib.request.urlopen(req,timeout=t) as r:return json.load(r)
+              except Exception:return None
+
+          def variants(name):
+              raw=re.sub(r'\s+','',name)
+              n=len(raw); vs=[]
+              # all single split positions
+              for i in range(1,n): vs.append(raw[:i]+' '+raw[i:])
+              # selected two-split forms; enough for three-part Western/Asian names while capping query size
+              if 6<=n<=16:
+                  for i in range(1,min(6,n-2)+1):
+                      for j in range(i+1,min(i+7,n)):
+                          if j<n: vs.append(raw[:i]+' '+raw[i:j]+' '+raw[j:])
+              # Prefer balanced-looking tokens and cap to 36 variants.
+              def score(v):
+                  parts=v.split(); return -sum(abs(len(p)-3) for p in parts)
+              vs=sorted(set(vs),key=score,reverse=True)[:36]
+              return vs
+
+          def resolve(name):
+              nk=norm(name)
+              if len(nk)<=2:return None
+              vs=variants(name)
+              # MediaWiki query parser accepts OR. Quote each variant to reward exact phrase matches.
+              q=' OR '.join('"'+v+'"' for v in vs)
+              params=urllib.parse.urlencode({'action':'query','format':'json','utf8':1,'generator':'search','gsrsearch':q,'gsrnamespace':0,'gsrlimit':20,'prop':'pageprops|extracts','ppprop':'wikibase_item','exintro':1,'explaintext':1,'exsentences':10,'redirects':1})
+              data=get('https://ko.wikipedia.org/w/api.php?'+params,12)
+              if not data:return None
+              for p in ((data.get('query') or {}).get('pages') or {}).values():
+                  title=p.get('title') or ''
+                  if ct(title)==nk:
+                      return title,(p.get('pageprops') or {}).get('wikibase_item'),(p.get('extract') or '')
+              return None
+
+          resolved={}
+          with ThreadPoolExecutor(max_workers=16) as ex:
+              fs={ex.submit(resolve,n):(i,n) for i,_,n,_,h in targets}
+              for f in as_completed(fs):
+                  i,n=fs[f]
+                  try:resolved[i]=f.result()
+                  except Exception:resolved[i]=None
+
+          qids=sorted({r[1] for r in resolved.values() if r and r[1]})
+          def entities(ids,props='labels|descriptions|claims'):
+              if not ids:return {}
+              params=urllib.parse.urlencode({'action':'wbgetentities','format':'json','ids':'|'.join(ids),'props':props,'languages':'ko|en','languagefallback':1})
+              return (get('https://www.wikidata.org/w/api.php?'+params,15) or {}).get('entities') or {}
+          ents={}
+          for j in range(0,len(qids),40):ents.update(entities(qids[j:j+40]))
+          def claimids(e,p):
+              a=[]
+              for c in (e.get('claims') or {}).get(p,[]):
+                  try:
+                      v=c['mainsnak']['datavalue']['value']
+                      if isinstance(v,dict) and v.get('id'):a.append(v['id'])
+                  except Exception:pass
+              return a
+          refs=set(); props=('P800','P166','P39','P106','P101','P135')
+          for e in ents.values():
+              for p in props:refs.update(claimids(e,p)[:3])
+          rents={};rl=sorted(refs)
+          for j in range(0,len(rl),50):rents.update(entities(rl[j:j+50],props='labels'))
+          def label(q):
+              e=rents.get(q) or ents.get(q) or {}; l=e.get('labels') or {}; x=l.get('ko') or l.get('en'); v=(x or {}).get('value') if x else None
+              if v and re.search(r'[A-Za-z]{7,}',v):return None
+              return v
+          def labs(e,p,n=2):
+              a=[]
+              for q in claimids(e,p):
+                  v=label(q)
+                  if v:a.append(v)
+                  if len(a)>=n:break
+              return a
+
+          verbs=('건국','세우','창립','설립','창시','발명','발견','개발','정립','확립','증명','제안','저술','집필','작곡','제작','지휘','주도','이끌','승리','정복','개혁','폐지','도입','통일','수립','완성','개척','수상','발표','해결','규명','창작','조직','보좌','확대','제정','독립','해방','운동','연구','기여','제작','설계','발전')
+          bad=('동음이의','성씨','지명','목록','분류:','위키미디어')
+          def clean(s):return html.unescape(re.sub(r'\s+',' ',s)).strip().rstrip('. ')
+          def from_extract(ext,name):
+              if not ext or any(x in ext[:100] for x in bad):return None
+              ss=[clean(x) for x in re.split(r'(?<=[.!?])\s+|\n+',ext) if clean(x)]
+              scored=[]
+              for idx,s in enumerate(ss[:12]):
+                  if not 20<=len(s)<=210:continue
+                  latin=len(re.findall(r'[A-Za-z]',s));hang=len(re.findall(r'[가-힣]',s))
+                  if latin>max(14,hang//2):continue
+                  score=sum(3 for v in verbs if v in s)-idx*.15
+                  if norm(name) in norm(s):score+=1
+                  if 30<=len(s)<=150:score+=1
+                  scored.append((score,s))
+              if not scored:return None
+              scored.sort(reverse=True,key=lambda x:x[0])
+              return scored[0][1] if scored[0][0]>=2.5 else None
+          def structured(qid):
+              e=ents.get(qid) or {}; works=labs(e,'P800',2); awards=labs(e,'P166',1);pos=labs(e,'P39',1);occ=labs(e,'P106',2);fld=labs(e,'P101',2);mov=labs(e,'P135',1)
+              if works:return f'{"·".join(works)} 등 대표 저작·작품을 남김'
+              if awards and fld:return f'{"·".join(fld)} 분야에서 활동해 {awards[0]}을 수상함'
+              if fld and occ:return f'{"·".join(fld)} 분야에서 활동한 {"·".join(occ)}로 주요 연구·활동을 남김'
+              if pos and occ:return f'{pos[0]}를 지낸 {"·".join(occ)}로 정치·사회 활동을 펼침'
+              if mov and occ:return f'{mov[0]} 흐름을 대표한 {"·".join(occ)}로 활동함'
+              return None
+
+          repl={}; improved=0; extract_count=0; struct_count=0
+          for i,left,name,ach,h in targets:
+              r=resolved.get(i)
+              if not r:continue
+              title,qid,ext=r
+              s=from_extract(ext,name)
+              if s:extract_count+=1
+              elif qid:
+                  s=structured(qid)
+                  if s:struct_count+=1
+              if s and s!=ach:repl[i]=s;improved+=1
+
+          out=[]
+          for i,line in enumerate(lines):
+              p=parse(line)
+              if p and i in repl:line=f'- {p[0]} — {repl[i]}'
+              out.append(line)
+          new='\n'.join(out)+'\n'
+          rem=0;sec=False;achs=[]
+          for line in new.splitlines():
+              if line.strip()=='## 2차 확장 후보':sec=True
+              p=parse(line)
+              if p:
+                  achs.append(p[2])
+                  if sec and any(m in p[2] for m in markers):rem+=1
+          dup=sum(1 for c in Counter(achs).values() if c>1)
+          if dup:raise SystemExit(f'exact duplicate groups remain: {dup}')
+          path.write_text(new,encoding='utf-8')
+          print(f'targets={len(targets)} resolved={sum(bool(r) for r in resolved.values())} improved={improved} from_extract={extract_count} from_structured={struct_count} unresolved_generic={rem} exact_duplicate_text_groups=0')
+          PY
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add LIST.md
+          if ! git diff --cached --quiet; then
+            git commit -m "Resolve concatenated-name LIST achievements"
+            git push
+          fi
+      - name: Remove one-time workflow
+        shell: bash
+        run: |
+          git pull --rebase origin main
+          rm -f .github/workflows/selective-achievement-fix-v5.yml
+          git add -A
+          git commit -m "Remove combinational LIST repair workflow"
+          git push
