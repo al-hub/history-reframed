@@ -1,0 +1,47 @@
+name: Extract problematic LIST entries
+on:
+  push:
+    paths:
+      - .github/workflows/extract-problematic-list.yml
+permissions:
+  contents: write
+jobs:
+  extract:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Extract remaining generic entries
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          markers=('중요한 영향을 끼침','큰 영향을 끼침','중요한 업적을 남김','중요한 기여를 함')
+          lines=Path('LIST.md').read_text(encoding='utf-8').splitlines()
+          out=['# Remaining problematic LIST entries','']
+          sec=False; heading=''
+          n=0
+          for i,line in enumerate(lines,1):
+              if line.strip()=='## 2차 확장 후보':sec=True;continue
+              if sec and line.startswith('### '):
+                  heading=line[4:].strip();out+=['',f'## {heading}',''];continue
+              if not sec or not line.startswith('- ') or ' — ' not in line:continue
+              left,ach=line[2:].split(' — ',1)
+              if any(m in ach for m in markers):
+                  n+=1
+                  out.append(f'{n}\t{i}\t{heading}\t{left.strip()}\t{ach.strip()}')
+          Path('PROBLEMATIC.tmp').write_text('\n'.join(out)+'\n',encoding='utf-8')
+          print('remaining=',n)
+          PY
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add PROBLEMATIC.tmp
+          git commit -m "Extract remaining problematic LIST entries"
+          git push
+      - name: Remove extractor workflow
+        shell: bash
+        run: |
+          git pull --rebase origin main
+          rm -f .github/workflows/extract-problematic-list.yml
+          git add -A
+          git commit -m "Remove problematic LIST extractor workflow"
+          git push
