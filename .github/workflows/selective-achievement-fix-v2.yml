@@ -1,0 +1,210 @@
+name: Selective LIST achievement repair v2
+
+on:
+  push:
+    paths:
+      - .github/workflows/selective-achievement-fix-v2.yml
+
+permissions:
+  contents: write
+
+jobs:
+  repair:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Match unspaced names through Korean Wikipedia and repair generic entries
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          from concurrent.futures import ThreadPoolExecutor, as_completed
+          from collections import Counter
+          import json, re, urllib.parse, urllib.request
+
+          path=Path('LIST.md')
+          lines=path.read_text(encoding='utf-8').splitlines()
+          headers={'User-Agent':'history-reframed-list-repair/2.0'}
+
+          def parse(line):
+              if not line.startswith('- ') or ' — ' not in line: return None
+              left,ach=line[2:].split(' — ',1); left=left.strip(); ach=ach.strip()
+              name=left[1:left.index('](')] if left.startswith('[') and '](' in left else left
+              return left,name.strip(),ach
+          def norm(s): return re.sub(r'[^0-9A-Za-z가-힣]','',s).lower()
+          markers=('중요한 영향을 끼침','큰 영향을 끼침','중요한 업적을 남김','중요한 기여를 함')
+
+          targets=[]; second=False; heading=''
+          for i,line in enumerate(lines):
+              if line.strip()=='## 2차 확장 후보': second=True; continue
+              if second and line.startswith('### '): heading=line[4:].strip(); continue
+              p=parse(line) if second else None
+              if p and any(m in p[2] for m in markers): targets.append((i,*p,heading))
+
+          # Search Korean Wikipedia: its full-text search handles missing spaces in many transliterated names.
+          def find_qid(name,heading):
+              if len(norm(name)) <= 2: return None
+              params=urllib.parse.urlencode({
+                  'action':'query','format':'json','utf8':1,'generator':'search','gsrsearch':name,
+                  'gsrnamespace':0,'gsrlimit':7,'prop':'pageprops','ppprop':'wikibase_item','redirects':1
+              })
+              try:
+                  req=urllib.request.Request('https://ko.wikipedia.org/w/api.php?'+params,headers=headers)
+                  with urllib.request.urlopen(req,timeout=7) as r: data=json.load(r)
+              except Exception: return None
+              nk=norm(name); candidates=[]
+              for page in ((data.get('query') or {}).get('pages') or {}).values():
+                  title=page.get('title') or ''; q=(page.get('pageprops') or {}).get('wikibase_item')
+                  if not q: continue
+                  tk=norm(re.sub(r'\([^)]*\)$','',title).strip())
+                  score=0
+                  if tk==nk: score=20
+                  elif len(nk)>=5 and (tk.startswith(nk) or nk.startswith(tk)): score=8
+                  else: continue
+                  candidates.append((score,q,title))
+              if not candidates: return None
+              candidates.sort(reverse=True)
+              return candidates[0][1]
+
+          qmap={}
+          with ThreadPoolExecutor(max_workers=30) as ex:
+              fs={ex.submit(find_qid,n,h):(i,n) for i,_,n,_,h in targets}
+              for f in as_completed(fs):
+                  i,n=fs[f]
+                  try: qmap[i]=f.result()
+                  except Exception: qmap[i]=None
+
+          qids=sorted({q for q in qmap.values() if q})
+          def get_entities(ids,props='labels|descriptions|claims'):
+              if not ids:return {}
+              params=urllib.parse.urlencode({'action':'wbgetentities','format':'json','ids':'|'.join(ids),'props':props,'languages':'ko|en','languagefallback':1})
+              req=urllib.request.Request('https://www.wikidata.org/w/api.php?'+params,headers=headers)
+              with urllib.request.urlopen(req,timeout=15) as r:return (json.load(r).get('entities') or {})
+          ents={}
+          for j in range(0,len(qids),40):
+              try: ents.update(get_entities(qids[j:j+40]))
+              except Exception: pass
+
+          def claim_ids(ent,p):
+              out=[]
+              for c in (ent.get('claims') or {}).get(p,[]):
+                  try:
+                      v=c['mainsnak']['datavalue']['value']
+                      if isinstance(v,dict) and v.get('id'): out.append(v['id'])
+                  except Exception:pass
+              return out
+          props=('P800','P166','P39','P106','P101','P135')
+          refs=set()
+          for e in ents.values():
+              for p in props: refs.update(claim_ids(e,p)[:3])
+          rents={}; rl=sorted(refs)
+          for j in range(0,len(rl),50):
+              try:rents.update(get_entities(rl[j:j+50],props='labels'))
+              except Exception:pass
+          def lab(q):
+              e=rents.get(q) or ents.get(q) or {}; l=e.get('labels') or {}; x=l.get('ko') or l.get('en')
+              v=(x or {}).get('value') if x else None
+              if v and re.search(r'[A-Za-z]{5,}',v): return None
+              return v
+          def labs(e,p,n=2):
+              a=[]
+              for q in claim_ids(e,p):
+                  x=lab(q)
+                  if x:a.append(x)
+                  if len(a)>=n:break
+              return a
+
+          # A small hand-curated set fixes especially obvious, important cases that structured metadata under-describes.
+          manual={
+              '우':'대홍수 치수 전승으로 이름을 남기고 하나라의 시조로 전해짐',
+              '탕':'하나라를 무너뜨리고 상나라를 세운 군주로 전해짐',
+              '주공':'성왕을 보좌하며 서주 초기 통치 질서와 예악 제도의 토대를 마련함',
+              '강태공':'주 무왕을 도와 상나라를 무너뜨리고 제나라의 시조가 됨',
+              '관중':'제 환공을 보좌해 행정·경제·군사 개혁을 추진하고 제나라의 패업을 뒷받침함',
+              '오기':'전국시대 장군·병법가로 군제 개혁과 『오자병법』으로 이름을 남김',
+              '상앙':'진나라에서 변법을 추진해 중앙집권과 군공 중심의 국가 체제를 강화함',
+              '소진':'합종책을 주장해 여러 제후국의 반진 연합을 추진함',
+              '장의':'연횡책을 통해 진나라 중심의 외교 전략을 추진함',
+              '굴원':'『이소』 등 초사를 대표하는 작품을 남긴 중국 고대 시인',
+              '이사':'진시황을 보좌해 군현제와 문자 통일 등 진 제국의 중앙집권 정책을 추진함',
+              '몽염':'진나라 장군으로 흉노를 북방으로 밀어내고 북방 방어를 강화함',
+              '항우':'진 멸망기에 거병해 거록대전에서 승리하고 초한전쟁의 한 축을 이끎',
+              '한신':'유방 휘하의 명장으로 한나라 건국 과정의 주요 전쟁을 승리로 이끎',
+              '장량':'유방의 책사로 초한전쟁 승리와 한나라 건국에 핵심 역할을 함',
+              '소하':'한나라 초대 승상으로 행정 체제를 정비하고 유방의 천하 통일을 지원함',
+              '갈루아':'다항방정식의 해법 문제를 군의 구조와 연결해 갈루아 이론의 토대를 세움',
+              '에바리스트갈루아':'다항방정식의 해법 문제를 군의 구조와 연결해 갈루아 이론의 토대를 세움',
+              '오귀스탱코시':'극한·연속·수렴 개념을 엄밀하게 다루며 해석학의 기초를 확립함',
+              '볼타':'볼타 전지를 개발해 지속적인 전류를 발생시키는 전지 기술의 토대를 마련함',
+              '앙페르':'전류 사이의 힘을 수학적으로 설명하며 전기역학 발전에 기여함',
+              '게오르크옴':'전압·전류·저항의 관계를 나타내는 옴의 법칙을 정립함',
+              '헨드릭로런츠':'로런츠 변환과 전자기 이론 발전에 기여해 상대성이론의 수학적 토대를 마련함',
+              '조지프존톰슨':'음극선 연구를 통해 전자를 발견하고 원자의 내부 구조 연구를 발전시킴',
+              '밀리컨':'기름방울 실험으로 전자의 전하량을 정밀하게 측정함',
+              '로저펜로즈':'일반상대성이론에서 중력붕괴가 특이점으로 이어짐을 수학적으로 증명함',
+              '갈레노스':'해부·생리·의학 이론을 체계화해 서양 의학에 오랫동안 큰 영향을 남김',
+              '베살리우스':'인체 해부를 직접 관찰해 『인체의 구조에 관하여』를 펴내고 근대 해부학의 기초를 세움',
+              '마르첼로말피기':'현미경으로 모세혈관을 관찰해 동맥과 정맥의 연결을 확인하고 미세해부학을 발전시킴',
+              '로버트브라운':'식물 세포에서 핵을 관찰·기술하고 브라운 운동으로 알려진 현상을 기록함',
+              '마티아스슐라이덴':'식물이 세포로 이루어진다는 관점을 제시해 세포설 형성에 기여함',
+              '테오도어슈반':'동물도 세포로 이루어졌음을 제시해 슐라이덴과 함께 세포설의 기초를 세움'
+          }
+
+          def specific(name,qid):
+              if name in manual:return manual[name]
+              e=ents.get(qid) or {}; d=((e.get('descriptions') or {}).get('ko') or {}).get('value') or ''
+              works=labs(e,'P800',2); awards=labs(e,'P166',1); pos=labs(e,'P39',1); occ=labs(e,'P106',2); fld=labs(e,'P101',2); mov=labs(e,'P135',1)
+              if works:return f'{"·".join(works)} 등 대표 저작·작품으로 이름을 남김'
+              if awards and fld:return f'{"·".join(fld)} 분야에서 활동하며 {awards[0]}을 수상함'
+              if fld and occ:return f'{"·".join(fld)} 분야를 연구한 {"·".join(occ)}로 활동함'
+              if pos and occ:return f'{pos[0]}를 지낸 {"·".join(occ)}로 활동함'
+              if mov and occ:return f'{mov[0]}을 대표한 {"·".join(occ)}로 활동함'
+              if d and len(d)<=70 and not re.search(r'[A-Za-z]{6,}',d):return d.rstrip('. ')
+              return None
+
+          repl={}; improved=0
+          for i,left,name,ach,h in targets:
+              s=manual.get(name)
+              if not s:
+                  q=qmap.get(i)
+                  if q:s=specific(name,q)
+              if s and s!=ach and len(s)>=8: repl[i]=s; improved+=1
+
+          out=[]
+          for i,line in enumerate(lines):
+              p=parse(line)
+              if p and i in repl: line=f'- {p[0]} — {repl[i]}'
+              out.append(line)
+          new='\n'.join(out)+'\n'
+          remaining=0; sec=False; achs=[]
+          for line in new.splitlines():
+              if line.strip()=='## 2차 확장 후보':sec=True
+              p=parse(line)
+              if p:
+                  achs.append(p[2])
+                  if sec and any(m in p[2] for m in markers):remaining+=1
+          exact=sum(1 for c in Counter(achs).values() if c>1)
+          if exact:raise SystemExit(f'exact duplicate achievement texts remain: {exact}')
+          path.write_text(new,encoding='utf-8')
+          print(f'targets={len(targets)} mapped_qids={sum(bool(x) for x in qmap.values())} improved={improved} unresolved_generic={remaining} exact_duplicate_text_groups=0')
+          PY
+
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add LIST.md
+          if ! git diff --cached --quiet; then
+            git commit -m "Improve generic LIST achievements with specific facts"
+            git push
+          fi
+
+      - name: Remove one-time workflow
+        shell: bash
+        run: |
+          git pull --rebase origin main
+          rm -f .github/workflows/selective-achievement-fix-v2.yml
+          git add -A
+          git commit -m "Remove second selective LIST repair workflow"
+          git push
