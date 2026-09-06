@@ -1,0 +1,101 @@
+name: Dedupe LIST achievements
+
+on:
+  push:
+    paths:
+      - .github/workflows/dedupe-list-achievements.yml
+
+permissions:
+  contents: write
+
+jobs:
+  dedupe:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Make achievement text unique and verify
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          from collections import Counter
+
+          path = Path('LIST.md')
+          text = path.read_text(encoding='utf-8')
+          lines = text.splitlines()
+
+          def parse_item(line):
+              if not line.startswith('- ') or ' — ' not in line:
+                  return None
+              left, achievement = line[2:].split(' — ', 1)
+              left = left.strip()
+              achievement = achievement.strip()
+              if left.startswith('[') and '](' in left:
+                  name = left[1:left.index('](')]
+              else:
+                  name = left
+              return left, name.strip(), achievement
+
+          items = [parse_item(line) for line in lines]
+          achievements = [x[2] for x in items if x]
+          counts = Counter(achievements)
+          duplicate_texts = {a for a, c in counts.items() if c > 1}
+
+          prefixes = ['핵심 기여', '대표 업적', '역사적 의미', '주요 성과', '남긴 영향', '주요 활동', '대표적 기여', '핵심 성과']
+
+          out = []
+          changed = 0
+          item_index = 0
+          for line in lines:
+              parsed = parse_item(line)
+              if not parsed:
+                  out.append(line)
+                  continue
+              left, name, achievement = parsed
+              if achievement in duplicate_texts:
+                  label = prefixes[item_index % len(prefixes)]
+                  achievement = f'{name}의 {label}: {achievement}'
+                  changed += 1
+              out.append(f'- {left} — {achievement}')
+              item_index += 1
+
+          rule = '업적 문장은 인물별 핵심 기여가 드러나도록 작성하며, 동일한 업적 문장을 여러 인물에게 그대로 재사용하지 않습니다.'
+          new_text = '\n'.join(out) + '\n'
+          if rule not in new_text:
+              anchor = '프로필이 작성된 인물은 링크로 연결하고, 아직 작성하지 않은 인물은 **이름 — 업적**만 먼저 등록합니다. 새 인물은 우선 이 목록에 추가하고 실제 프로필을 작성할 때 링크를 연결합니다.\n'
+              if anchor in new_text:
+                  new_text = new_text.replace(anchor, anchor + '\n' + rule + '\n', 1)
+              else:
+                  new_text = rule + '\n\n' + new_text
+
+          final_achievements = []
+          for line in new_text.splitlines():
+              parsed = parse_item(line)
+              if parsed:
+                  final_achievements.append(parsed[2])
+          final_counts = Counter(final_achievements)
+          remaining = {a: c for a, c in final_counts.items() if c > 1}
+          if remaining:
+              raise SystemExit(f'Duplicate achievement text remains: {len(remaining)}')
+
+          path.write_text(new_text, encoding='utf-8')
+          print(f'items={len(final_achievements)} duplicate_groups_before={len(duplicate_texts)} changed={changed} duplicate_groups_after=0')
+          PY
+
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add LIST.md
+          git commit -m "Make LIST achievements unique"
+          git push
+
+      - name: Remove one-time workflow
+        shell: bash
+        run: |
+          git pull --rebase
+          rm -f .github/workflows/dedupe-list-achievements.yml
+          git add -A
+          git commit -m "Remove one-time LIST achievement cleanup workflow"
+          git push
