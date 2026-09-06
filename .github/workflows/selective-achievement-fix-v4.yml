@@ -1,0 +1,157 @@
+name: Selective LIST achievement repair v4
+
+on:
+  push:
+    paths:
+      - .github/workflows/selective-achievement-fix-v4.yml
+
+permissions:
+  contents: write
+
+jobs:
+  repair:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Resolve concatenated names by title-prefix splits
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          from concurrent.futures import ThreadPoolExecutor, as_completed
+          from collections import Counter
+          import html,json,re,time,urllib.parse,urllib.request
+
+          path=Path('LIST.md');lines=path.read_text(encoding='utf-8').splitlines()
+          headers={'User-Agent':'history-reframed-list-repair/4.0'}
+          markers=('중요한 영향을 끼침','큰 영향을 끼침','중요한 업적을 남김','중요한 기여를 함')
+          def parse(line):
+              if not line.startswith('- ') or ' — ' not in line:return None
+              left,ach=line[2:].split(' — ',1);left=left.strip();ach=ach.strip()
+              name=left[1:left.index('](')] if left.startswith('[') and '](' in left else left
+              return left,name.strip(),ach
+          def norm(s):return re.sub(r'[^0-9A-Za-z가-힣]','',s).lower()
+          def canon_title(s):return norm(re.sub(r'\s*\([^)]*\)\s*$','',s))
+          targets=[];sec=False;heading=''
+          for i,line in enumerate(lines):
+              if line.strip()=='## 2차 확장 후보':sec=True;continue
+              if sec and line.startswith('### '):heading=line[4:].strip();continue
+              p=parse(line) if sec else None
+              if p and any(m in p[2] for m in markers):targets.append((i,*p,heading))
+
+          def get_json(url,timeout=10):
+              try:
+                  req=urllib.request.Request(url,headers=headers)
+                  with urllib.request.urlopen(req,timeout=timeout) as r:return json.load(r)
+              except Exception:return None
+
+          def prefix_match(name):
+              nk=norm(name)
+              if len(nk)<=2:return None
+              # Try every plausible first-name/word boundary. Exact normalized full title is mandatory.
+              raw=name.replace(' ','')
+              cuts=list(range(1,min(len(raw),8)))
+              # Prefer longer prefixes first; reduces huge one-syllable result sets.
+              cuts=sorted(cuts,reverse=True)
+              for k in cuts:
+                  prefix=raw[:k]+' '
+                  params=urllib.parse.urlencode({'action':'query','format':'json','utf8':1,'list':'prefixsearch','pssearch':prefix,'psnamespace':0,'pslimit':100})
+                  data=get_json('https://ko.wikipedia.org/w/api.php?'+params,7)
+                  if not data:continue
+                  for hit in (data.get('query') or {}).get('prefixsearch',[]):
+                      title=hit.get('title') or ''
+                      ct=canon_title(title)
+                      # Exact once spaces/punctuation are removed; tolerate a single Latin middle initial absent from source name.
+                      if ct==nk:
+                          return title
+                      stripped=re.sub(r'(?<=[가-힣])[a-z](?=[가-힣])','',ct)
+                      if len(nk)>=6 and stripped==nk:return title
+              return None
+
+          titlemap={}
+          with ThreadPoolExecutor(max_workers=18) as ex:
+              fs={ex.submit(prefix_match,n):(i,n) for i,_,n,_,h in targets}
+              for f in as_completed(fs):
+                  i,n=fs[f]
+                  try:titlemap[i]=f.result()
+                  except Exception:titlemap[i]=None
+
+          matched_titles=sorted({t for t in titlemap.values() if t})
+          # Fetch lead extracts in batches by exact resolved title.
+          extracts={}
+          for j in range(0,len(matched_titles),20):
+              batch=matched_titles[j:j+20]
+              params=urllib.parse.urlencode({'action':'query','format':'json','utf8':1,'titles':'|'.join(batch),'prop':'extracts','exintro':1,'explaintext':1,'exsentences':6,'redirects':1})
+              data=get_json('https://ko.wikipedia.org/w/api.php?'+params,15)
+              if not data:continue
+              for p in ((data.get('query') or {}).get('pages') or {}).values():
+                  title=p.get('title') or '';ext=(p.get('extract') or '').strip()
+                  extracts[canon_title(title)]=ext
+
+          achievement_verbs=('건국','세우','창립','설립','창시','발명','발견','개발','정립','확립','증명','제안','저술','집필','작곡','제작','지휘','주도','이끌','승리','정복','개혁','폐지','도입','통일','수립','완성','개척','수상','발표','해결','규명','창작','조직','보좌','확대','제정','독립','해방','운동','연구')
+          bad=('동음이의','성씨','지명','목록','분류:','위키미디어')
+          def clean(s):
+              s=html.unescape(re.sub(r'\s+',' ',s)).strip();s=re.sub(r'\[[0-9]+\]','',s);return s.rstrip('. ')
+          def choose(ext,name):
+              if not ext or any(b in ext[:100] for b in bad):return None
+              # Korean Wikipedia often has long first sentences; split additionally on semicolon-like punctuation.
+              ss=[clean(x) for x in re.split(r'(?<=[.!?])\s+|\n+|(?<=다)\s+(?=[가-힣A-Z])',ext) if clean(x)]
+              scored=[]
+              for idx,s in enumerate(ss[:10]):
+                  if len(s)<12 or len(s)>220:continue
+                  latin=len(re.findall(r'[A-Za-z]',s));hang=len(re.findall(r'[가-힣]',s))
+                  if latin>max(12,hang//2):continue
+                  score=sum(3 for v in achievement_verbs if v in s)-idx*0.2
+                  if norm(name) in norm(s):score+=1
+                  if 25<=len(s)<=150:score+=1
+                  scored.append((score,s))
+              if not scored:return None
+              scored.sort(reverse=True,key=lambda x:x[0])
+              if scored[0][0] < 2:return None
+              return scored[0][1]
+
+          repl={};improved=0
+          for i,left,name,ach,h in targets:
+              title=titlemap.get(i)
+              if not title:continue
+              ext=extracts.get(canon_title(title)) or extracts.get(norm(name))
+              s=choose(ext,name)
+              if s and s!=ach:
+                  # Avoid copy-pasting article subject name twice when possible; keep factual sentence intact otherwise.
+                  repl[i]=s;improved+=1
+
+          out=[]
+          for i,line in enumerate(lines):
+              p=parse(line)
+              if p and i in repl:line=f'- {p[0]} — {repl[i]}'
+              out.append(line)
+          new='\n'.join(out)+'\n'
+          remaining=0;sec=False;achs=[]
+          for line in new.splitlines():
+              if line.strip()=='## 2차 확장 후보':sec=True
+              p=parse(line)
+              if p:
+                  achs.append(p[2])
+                  if sec and any(m in p[2] for m in markers):remaining+=1
+          exact=sum(1 for c in Counter(achs).values() if c>1)
+          if exact:raise SystemExit(f'exact duplicate achievement texts remain: {exact}')
+          path.write_text(new,encoding='utf-8')
+          print(f'targets={len(targets)} exact_titles={sum(bool(t) for t in titlemap.values())} improved={improved} unresolved_generic={remaining} exact_duplicate_text_groups=0')
+          PY
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add LIST.md
+          if ! git diff --cached --quiet; then
+            git commit -m "Resolve more generic LIST achievements"
+            git push
+          fi
+      - name: Remove one-time workflow
+        shell: bash
+        run: |
+          git pull --rebase origin main
+          rm -f .github/workflows/selective-achievement-fix-v4.yml
+          git add -A
+          git commit -m "Remove prefix-matching LIST repair workflow"
+          git push
